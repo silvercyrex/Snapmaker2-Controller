@@ -126,8 +126,13 @@ bool QuickStopService::CheckInISR(block_t *blk) {
     * triggered by PAUSE, just save env and switch to next state
     */
     case QS_SOURCE_PAUSE:
-      if (blk)
+      if (blk) {
         pl_recovery.SaveCmdLine(blk->filePos);
+        pl_recovery.SaveLaserInlineState(blk->laser.status.isEnabled);
+      }
+      else {
+        pl_recovery.SaveLaserInlineState(planner.laser_inline.status.isEnabled);
+      }
 
       // if power-loss appear atfer finishing PAUSE, won't save env again
       if (systemservice.GetCurrentStatus() != SYSTAT_PAUSE_FINISH)
@@ -220,12 +225,22 @@ void QuickStopService::Park() {
 
   switch (ModuleBase::toolhead()) {
   case MODULE_TOOLHEAD_3DP:
-    if(thermalManager.temp_hotend[0].current > 180)
-      retract = 6;
+  case MODULE_TOOLHEAD_DUALEXTRUDER:
+    // PREVENT_COLD_EXTRUSION protection is enabled without further temperature determination
+    // if(thermalManager.temp_hotend[0].current > 180) {
+      if (ModuleBase::toolhead() ==  MODULE_TOOLHEAD_DUALEXTRUDER)
+        retract = DUAL_EXTRUDER_RESUME_RETRACT_E_LENGTH;
+      else
+        retract = SINGLE_RESUME_RETRACT_E_LENGTH;
+    // }
 
     // for power loss, we don't have enough time
     if (source_ == QS_SOURCE_POWER_LOSS) {
-      current_position[E_AXIS] -= 2;
+      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_DUALEXTRUDER)
+        current_position[E_AXIS] -= DUAL_EXTRUDER_POWER_LOSS_RETRACT_E_LENGTH;
+      else
+        current_position[E_AXIS] -= SINGLE_POWER_LOSS_RETRACT_E_LENGTH;
+
       line_to_current_position(60);
       Z_enable;
       move_to_limited_ze(current_position[Z_AXIS] + 5, current_position[E_AXIS] - retract + 1, 20);
@@ -240,17 +255,20 @@ void QuickStopService::Park() {
     // move X to max position of home dir
     // move Y to max position
     if (X_HOME_DIR > 0)
-      move_to_limited_xy(X_MAX_POS, Y_MAX_POS, 60);
+      move_to_limited_xy(soft_endstop[X_AXIS].max, Y_MAX_POS, 60);
     else
-      move_to_limited_xy(0, Y_MAX_POS, 60);
+      move_to_limited_xy(soft_endstop[X_AXIS].min, Y_MAX_POS, 60);
     break;
 
   case MODULE_TOOLHEAD_LASER:
   case MODULE_TOOLHEAD_LASER_10W:
+  case MODULE_TOOLHEAD_LASER_20W:
+  case MODULE_TOOLHEAD_LASER_40W:
     // In the case of laser, we don't raise Z.
-    if (source_ == QS_SOURCE_STOP) {
+    if (source_ == QS_SOURCE_STOP || laser->security_status_) {
       move_to_limited_z(Z_MAX_POS, 30);
     }
+    laser->SetAirPumpSwitch(false, false);
     break;
 
   case MODULE_TOOLHEAD_CNC:
@@ -296,7 +314,11 @@ void QuickStopService::TurnOffPower() {
 
   BreathLightClose();
 
-  if ((ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER) || (ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_10W)) {
+  if ((ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER) ||
+      (ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_10W) ||
+      (ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_20W) ||
+      (ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_40W)
+  ) {
     // The laser movement stops immediately with no risk of damaging the model
     disable_power_domain(POWER_DOMAIN_1);
   }
@@ -305,7 +327,10 @@ void QuickStopService::TurnOffPower() {
 void QuickStopService::HandleProtection() {
   if (source_ != QS_SOURCE_SECURITY) return;
 
-  if (ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_10W) {
+  if (ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_10W ||
+      ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_20W ||
+      ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_40W
+  ) {
       // don't do nothing
   }
 }
@@ -318,12 +343,16 @@ void QuickStopService::EmergencyStop() {
     case MACHINE_TYPE_CNC:
       cnc.TurnOff();
       break;
-    case MACHINE_TYPE_3DPRINT:
+    case MACHINE_TYPE_DUALEXTRUDER:
       printer1->SetFan(1, 0);
+    case MACHINE_TYPE_3DPRINT:
       printer1->SetFan(0, 0);
+      // printer1->SetFan(2, 0);
       break;
     case MACHINE_TYPE_LASER:
     case MACHINE_TYPE_LASER_10W:
+    case MACHINE_TYPE_LASER_20W:
+    case MACHINE_TYPE_LASER_40W:
       laser->SetCameraLight(0);
       laser->SetFanPower(0);
       break;

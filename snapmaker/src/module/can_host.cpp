@@ -132,7 +132,7 @@ message_id_t CanHost::GetMessageID(func_id_t function_id, uint8_t sub_index) {
 ErrCode CanHost::SendStdCmd(CanStdMesgCmd_t &message) {
   CanPacket_t  packet;
 
-  if (message.id > MODULE_SUPPORT_CONNECTED_MAX)
+  if (message.id > MODULE_SUPPORT_MESSAGE_ID_MAX)
     return E_PARAM;
 
   if (map_message_function_[message.id].function.id == MODULE_FUNCTION_ID_INVALID)
@@ -171,14 +171,31 @@ ErrCode CanHost::SendStdCmd(CanStdFuncCmd_t &function, uint8_t sub_index) {
 
 
 void CanHost::SendHeartbeat() {
-  CanPacket_t packet = {CAN_CH_1, CAN_FRAME_STD_REMOTE, 0x01, 0, 0};
+  CanPacket_t packet;
+
+  // to avoid accessing adddress over 0x8040000, by Scott
+  packet.ft = CAN_FRAME_STD_REMOTE;
+  packet.ch = CAN_CH_1;
+  packet.id = 0x01;
+  packet.length = 0;
+  packet.data = NULL;
+
   can.Write(packet);
   packet.ch = CAN_CH_2;
   can.Write(packet);
 }
 
 void CanHost::SendEmergencyStop() {
-  CanPacket_t packet = {CAN_CH_1, CAN_FRAME_STD_REMOTE, 0x02, 0, 0};
+  CanPacket_t packet;
+
+  // to avoid accessing adddress over 0x8040000, by Scott
+  packet.ft = CAN_FRAME_STD_REMOTE;
+  packet.ch = CAN_CH_1;
+  packet.id = 0x02;
+  packet.length = 0;
+  packet.data = NULL;
+
+
   can.Write(packet);
   packet.ch = CAN_CH_2;
   can.Write(packet);
@@ -445,13 +462,20 @@ void CanHost::EventHandler(void *parameter) {
   // read all mac
   while (can.Read(CAN_FRAME_EXT_REMOTE, (uint8_t *)&mac, 1)) {
     LOG_I("\nNew Module: 0x%08X\n", mac.val);
-    InitModules(mac);
+    if (InitModules(mac) != E_SUCCESS) {
+      LOG_E("failed to init module: %08x: \n", mac.val);
+    }
   }
 
   linear_p->UpdateMachineSize();
 
+  if (linear_p->machine_size() == MACHINE_SIZE_A150) {
+    quick_change_adapter = false;
+  }
+
   for (int i = 0; static_modules[i] != NULL; i++) {
-      static_modules[i]->PostInit();
+    if (static_modules[i]->PostInit() != E_SUCCESS)
+      LOG_E("PostInit failed: 0x%08x\n", static_modules[i]->mac());
   }
   // broadcase modules have been initialized
   xEventGroupSetBits(event_group, EVENT_GROUP_MODULE_READY);
@@ -459,7 +483,9 @@ void CanHost::EventHandler(void *parameter) {
   for (;;) {
     if (can.Read(CAN_FRAME_EXT_REMOTE, (uint8_t *)&mac, 1)) {
       LOG_I("New Module: 0x%08X\n", mac.val);
-      InitModules(mac);
+      if (InitModules(mac) != E_SUCCESS) {
+        LOG_E("failed to init module: %08x: \n", mac.val);
+      }
     }
 
     for (;;) {
@@ -481,8 +507,6 @@ void CanHost::EventHandler(void *parameter) {
     }
 
     ModuleBase::StaticProcess();
-    for (int i = 0; static_modules[i] != NULL; i++)
-      static_modules[i]->Process();
 
     vTaskDelay(pdMS_TO_TICKS(receiver_speed_));
   }
@@ -589,11 +613,9 @@ ErrCode CanHost::InitModules(MAC_t &mac) {
     }
   }
 
-  // it is dynamic modules
-  ret = InitDynamicModule(mac, mac_index);
-  if (ret == E_SUCCESS) {
-    mac.bits.configured = 1;
-  }
+  // for now, to save resource, we won't init unknow modules
+  // but it can be upgraded
+  LOG_I("\nUnknown module! id=%u, ch=%u\n", MODULE_GET_DEVICE_ID(mac.val), mac.bits.channel);
 
 out:
   // if doesn't exist, record it in array

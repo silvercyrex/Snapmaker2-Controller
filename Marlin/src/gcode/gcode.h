@@ -450,6 +450,8 @@ private:
   #if ENABLED(SPINDLE_LASER_ENABLE) || (MOTHERBOARD == BOARD_SNAPMAKER_2_0)
     static void M3_M4(const bool is_M4);
     static void M5();
+    static void M7_M8(const bool is_M8);
+    static void M9(void);
   #endif
 
   #if ENABLED(EXTERNAL_CLOSED_LOOP_CONTROLLER)
@@ -901,6 +903,18 @@ private:
   static void M2001();
 
   static void M2002();
+
+  static void M3000();
+
+  static void M3001();
+
+  static void M3002();
+
+  static void M3003();
+
+  static void M3004();
+
+  static void M3005();
 
   static void T(const uint8_t tool_index);
 

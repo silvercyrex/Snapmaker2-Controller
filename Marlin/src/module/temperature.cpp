@@ -34,6 +34,7 @@
 
 #if (MOTHERBOARD == BOARD_SNAPMAKER_2_0)
   #include "snapmaker.h"
+  #include "../../../snapmaker/src/module/toolhead_laser.h"
 #endif
 
 #define MAX6675_SEPARATE_SPI EITHER(HEATER_0_USES_MAX6675, HEATER_1_USES_MAX6675) && PIN_EXISTS(MAX6675_SCK, MAX6675_DO)
@@ -752,7 +753,7 @@ void Temperature::_temp_error(const int8_t heater, PGM_P const serial_msg, PGM_P
 
 void Temperature::max_temp_error(const int8_t heater) {
   _temp_error(heater, PSTR(MSG_T_MAXTEMP), TEMP_ERR_PSTR(MSG_ERR_MAXTEMP, heater));
-  systemservice.ThrowException((ExceptionHost)heater,ETYPE_OVERRUN_MAXTEMP_AGAIN);
+  systemservice.ThrowException((ExceptionHost)heater,ETYPE_OVERRUN_MAXTEMP);
 }
 
 void Temperature::min_temp_error(const int8_t heater) {
@@ -1003,10 +1004,9 @@ void Temperature::manage_heater() {
         }
       }
 
-      if (temp_hotend[e].current > (HEATER_0_MAXTEMP + 10))
-        systemservice.ThrowException((ExceptionHost)(e), ETYPE_OVERRUN_MAXTEMP_AGAIN);
-      else if (temp_hotend[e].current > HEATER_0_MAXTEMP)
-        systemservice.ThrowException((ExceptionHost)(e), ETYPE_OVERRUN_MAXTEMP);
+      // comment below code cause will check over-temperature error in callback that receive temperautre of toolhead
+      // if (temp_hotend[e].current > temp_range[e].maxtemp)
+      //   systemservice.ThrowException((ExceptionHost)(e), ETYPE_OVERRUN_MAXTEMP);
 
       #if ENABLED(THERMAL_PROTECTION_HOTENDS)
         // Check for thermal runaway
@@ -2576,7 +2576,7 @@ void Temperature::isr() {
     /**
      * Standard heater PWM modulation
      */
-    if(MODULE_TOOLHEAD_3DP == ModuleBase::toolhead()) {
+    if(MODULE_TOOLHEAD_3DP == ModuleBase::toolhead() || MODULE_TOOLHEAD_DUALEXTRUDER == ModuleBase::toolhead()) {
       if (pwm_count_tmp >= 127) {
         pwm_count_tmp -= 127;
         #define _PWM_MOD(N,S,T) do{                           \
@@ -2683,6 +2683,12 @@ void Temperature::isr() {
     } // 3D printer
     else {
       //WRITE_HEATER_0(0);
+      if(MODULE_TOOLHEAD_LASER_20W == ModuleBase::toolhead() || MODULE_TOOLHEAD_LASER_40W == ModuleBase::toolhead()) {
+        if (laser->GetAirPumpSwitch())
+          WRITE_HEATER_BED(HIGH);
+        else
+          WRITE_HEATER_BED(LOW);
+      }
     } // CNC and Laser
 
   #else // SLOW_PWM_HEATERS
@@ -3204,6 +3210,12 @@ void Temperature::isr() {
     #endif
 
     bool Temperature::wait_for_hotend(const uint8_t target_extruder, const bool no_wait_for_cooling/*=true*/
+      #if ENABLED(ENABLE_CUSTOM_M109_PARAM)
+        ,
+        int16_t temp_window/*=TEMP_WINDOW*/,
+        int16_t temp_hystersis/*=TEMP_HYSTERESIS*/,
+        uint32_t  temp_residency_time/*=TEMP_RESIDENCY_TIME*/
+      #endif
       #if G26_CLICK_CAN_CANCEL
         , const bool click_to_cancel/*=false*/
       #endif
@@ -3211,7 +3223,11 @@ void Temperature::isr() {
       #if TEMP_RESIDENCY_TIME > 0
         millis_t residency_start_ms = 0;
         // Loop until the temperature has stabilized
-        #define TEMP_CONDITIONS (!residency_start_ms || PENDING(now, residency_start_ms + (TEMP_RESIDENCY_TIME) * 1000UL))
+        #if ENABLED(ENABLE_CUSTOM_M109_PARAM)
+          #define TEMP_CONDITIONS (!residency_start_ms || PENDING(now, residency_start_ms + (temp_residency_time) * 1000UL))
+        #else
+          #define TEMP_CONDITIONS (!residency_start_ms || PENDING(now, residency_start_ms + (TEMP_RESIDENCY_TIME) * 1000UL))
+        #endif
       #else
         // Loop until the temperature is very close target
         #define TEMP_CONDITIONS (wants_to_cool ? isCoolingHotend(target_extruder) : isHeatingHotend(target_extruder))
@@ -3254,7 +3270,14 @@ void Temperature::isr() {
           #if TEMP_RESIDENCY_TIME > 0
             SERIAL_ECHOPGM(" W:");
             if (residency_start_ms)
-              SERIAL_ECHO(long((((TEMP_RESIDENCY_TIME) * 1000UL) - (now - residency_start_ms)) / 1000UL));
+              #if ENABLED(ENABLE_CUSTOM_M109_PARAM)
+              {
+                if (temp_residency_time > 0)
+                  SERIAL_ECHO(long((((temp_residency_time) * 1000UL) - (now - residency_start_ms)) / 1000UL));
+              }
+              #else
+                SERIAL_ECHO(long((((TEMP_RESIDENCY_TIME) * 1000UL) - (now - residency_start_ms)) / 1000UL));
+              #endif
             else
               SERIAL_CHAR('?');
           #endif
@@ -3277,12 +3300,21 @@ void Temperature::isr() {
 
           if (!residency_start_ms) {
             // Start the TEMP_RESIDENCY_TIME timer when we reach target temp for the first time.
-            if (temp_diff < TEMP_WINDOW) {
-              residency_start_ms = now;
-              if (first_loop) residency_start_ms += (TEMP_RESIDENCY_TIME) * 1000UL;
-            }
+            #if ENABLED(ENABLE_CUSTOM_M109_PARAM)
+              if (temp_diff < temp_window)
+                residency_start_ms = now + (first_loop ? ((temp_residency_time * 1000U / 3) > 200 ? 200 : (temp_residency_time * 1000U )) : 0);
+            #else
+              if (temp_diff < TEMP_WINDOW) {
+                residency_start_ms = now;
+                if (first_loop) residency_start_ms += (TEMP_RESIDENCY_TIME) * 1000UL;
+              }
+            #endif
           }
-          else if (temp_diff > TEMP_HYSTERESIS) {
+          #if ENABLED(ENABLE_CUSTOM_M109_PARAM)
+            else if (temp_diff > temp_hystersis) {
+          #else
+            else if (temp_diff > TEMP_HYSTERESIS) {
+          #endif
             // Restart the timer whenever the temperature falls outside the hysteresis.
             residency_start_ms = now;
           }

@@ -86,9 +86,11 @@ void PowerLossRecovery::Init(void) {
 		if (ModuleBase::toolhead() == pre_data_.toolhead) {
 			systemservice.ThrowException(EHOST_MC, ETYPE_POWER_LOSS);
 
-			if (pre_data_.live_z_offset != 0) {
-				LOG_I("PL: changed live z: %.3f\n", pre_data_.live_z_offset);
-				levelservice.live_z_offset(pre_data_.live_z_offset);
+			if ((pre_data_.live_z_offset[0] != 0) || (pre_data_.live_z_offset[1] != 0)) {
+				LOG_I("PL: previous live z0: %.3f, previous live z1: %.3f\n", levelservice.live_z_offset((uint8_t)0), levelservice.live_z_offset((uint8_t)1));
+				LOG_I("PL: changed live z0: %.3f, changed live z1: %.3f\n", pre_data_.live_z_offset[0], pre_data_.live_z_offset[1]);
+				levelservice.live_z_offset(pre_data_.live_z_offset[0], 0);
+				levelservice.live_z_offset(pre_data_.live_z_offset[1], 1);
 				settings.save();
 			}
 
@@ -342,6 +344,7 @@ void PowerLossRecovery::MaskPowerPanicData(void)
 int PowerLossRecovery::SaveEnv(void) {
   int     i = 0;
   uint8_t *pBuff;
+	float backup_position[X_TO_E];
 
 	LOOP_XN(idx) cur_data_.position_shift[idx] = position_shift[idx];
 
@@ -358,39 +361,57 @@ int PowerLossRecovery::SaveEnv(void) {
 	cur_data_.feedrate_percentage = feedrate_percentage;
 
 	// if live z offset was changed when working, record it
-	if (levelservice.live_z_offset_updated())
-		cur_data_.live_z_offset = levelservice.live_z_offset();
-	else
-		cur_data_.live_z_offset = 0;
-
-  cur_data_.accumulator = print_job_timer.duration();
-
-  // if power loss, we have record the position to cur_data_.PositionData[]
-	// NOTE that we save native position for XYZ
-	for (i=0; i<NUM_AXIS; i++) {
-		cur_data_.PositionData[i] = current_position[i];
+	if (levelservice.live_z_offset_updated()) {
+		cur_data_.live_z_offset[0] = levelservice.live_z_offset((uint8_t)0);
+		cur_data_.live_z_offset[1] = levelservice.live_z_offset((uint8_t)1);
+	} else {
+		cur_data_.live_z_offset[0] = 0;
+		cur_data_.live_z_offset[1] = 0;
 	}
 
-	switch (ModuleBase::toolhead())
-	{
+  cur_data_.accumulator = print_job_timer.duration();
+	cur_data_.adapter = quick_change_adapter;
+
+  // if power loss, we have record the position to cur_data_.PositionData[]
+  // NOTE that we save native position for XYZ
+  LOOP_X_TO_EN(i) cur_data_.PositionData[i] = current_position[i];
+
+	switch (ModuleBase::toolhead()) {
 	case MODULE_TOOLHEAD_CNC:
 		cur_data_.cnc_power = cnc.power();
 		break;
 
 	case MODULE_TOOLHEAD_LASER:
 	case MODULE_TOOLHEAD_LASER_10W:
+  case MODULE_TOOLHEAD_LASER_20W:
+  case MODULE_TOOLHEAD_LASER_40W:
 		cur_data_.laser_percent = laser->power();
 		cur_data_.laser_pwm = laser->tim_pwm();
-	    laser->TurnOff();
-	break;
+		cur_data_.air_pump_switch = laser->GetAirPumpSwitch();
+		cur_data_.half_power_mode = laser->GetHalfPowerMode();
+		cur_data_.laser_inline_enable = laser_inline_enable_;
+	  laser->TurnOff();
+	  break;
 
   case MODULE_TOOLHEAD_3DP:
+  case MODULE_TOOLHEAD_DUALEXTRUDER:
     for (i = 0; i < PP_FAN_COUNT; i++)
       cur_data_.FanSpeed[i] = printer1->fan_speed(i);
     // extruders' temperature
-    HOTEND_LOOP() cur_data_.HeaterTemp[e] = thermalManager.temp_hotend[e].target;
+    HOTEND_LOOP() {
+      cur_data_.HeaterTemp[e]       = thermalManager.temp_hotend[e].target;
+      cur_data_.flow_percentage[e]  = planner.flow_percentage[e];
+      cur_data_.extruders_feedrate_percentage[e] = extruders_feedrate_percentage[e];
+    }
     // heated bed
     cur_data_.BedTamp = thermalManager.temp_bed.target;
+    cur_data_.active_extruder = actual_extruder;
+
+		if (ModuleBase::toolhead() == MODULE_TOOLHEAD_DUALEXTRUDER && systemservice.tool_changing \
+			  && systemservice.GetBackupCurrentPosition(backup_position, sizeof(backup_position))) {
+			LOOP_X_TO_EN(i) cur_data_.PositionData[i] = backup_position[i];
+			cur_data_.too_changing = true;
+		}
     break;
 
 	default:
@@ -429,6 +450,15 @@ int PowerLossRecovery::SaveEnv(void) {
 }
 
 void PowerLossRecovery::Resume3DP() {
+	HOTEND_LOOP() {
+    // restore feedrate_percentage
+    extruders_feedrate_percentage[e] = pre_data_.extruders_feedrate_percentage[e];
+    // restore flow_percentage
+    planner.flow_percentage[e] = pre_data_.flow_percentage[e];
+  }
+
+	feedrate_percentage = extruders_feedrate_percentage[pre_data_.active_extruder];
+
 	// enable hotend
 	if(pre_data_.BedTamp > BED_MAXTEMP - 15) {
 		LOG_W("recorded bed temp [%f] is larger than %f, limited it.\n",
@@ -436,43 +466,54 @@ void PowerLossRecovery::Resume3DP() {
 		pre_data_.BedTamp = BED_MAXTEMP - 15;
 	}
 
-	if (pre_data_.HeaterTemp[0] > HEATER_0_MAXTEMP - 15) {
-		LOG_W("recorded hotend temp [%f] is larger than %f, limited it.\n",
-						pre_data_.BedTamp, HEATER_0_MAXTEMP - 15);
-		pre_data_.HeaterTemp[0] = HEATER_0_MAXTEMP - 15;
-	}
+	if (pre_data_.HeaterTemp[pre_data_.active_extruder] < EXTRUDE_MINTEMP)
+		pre_data_.HeaterTemp[pre_data_.active_extruder] = EXTRUDE_MINTEMP;
 
-	if (pre_data_.HeaterTemp[0] < 180)
-		pre_data_.HeaterTemp[0] = 180;
+  HOTEND_LOOP() {
+    if (pre_data_.HeaterTemp[e] >= thermalManager.temp_range[e].maxtemp - 15) {
+      LOG_W("recorded hotend temp [%f] is larger than %f, limited it.\n",
+						pre_data_.HeaterTemp[e], thermalManager.temp_range[e].maxtemp - 15);
+      pre_data_.HeaterTemp[e] = thermalManager.temp_range[e].maxtemp - 15;
+    }
+
+    thermalManager.setTargetHotend(pre_data_.HeaterTemp[e], e);
+  }
+
+	thermalManager.setTargetBed(pre_data_.BedTamp);
 
 	/* when recover 3DP from power-loss, maybe the filament is freezing because
 	 * nozzle has been cooling. If we raise Z in this condition, the model will
 	 * be pulled up, sometimes it will break the model.
-	 * So we heating the hotend to 150 celsius degree before raising Z
+	 * So we heating the hotend to EXTRUDE_MINTEMP celsius degree before raising Z
 	 */
-	thermalManager.setTargetBed(pre_data_.BedTamp);
-	thermalManager.setTargetHotend(pre_data_.HeaterTemp[0], 0);
-
-  	while (thermalManager.degHotend(0) < 150) idle();
+  while (thermalManager.degHotend(pre_data_.active_extruder) < 150) idle();
 
 	RestoreWorkspace();
 
 	// waiting temperature reach target
 	thermalManager.wait_for_bed(true);
-	thermalManager.wait_for_hotend(0, true);
+	thermalManager.wait_for_hotend(pre_data_.active_extruder, true);
 
   	// recover FAN speed after heating to save time
 	for (int i = 0; i < PP_FAN_COUNT; i++) {
 		printer1->SetFan(i, pre_data_.FanSpeed[i]);
 	}
 
-	current_position[E_AXIS] += 20;
-	line_to_current_position(5);
-	planner.synchronize();
+	if (pre_data_.toolhead == MODULE_TOOLHEAD_DUALEXTRUDER)
+    printer1->ToolChange(pre_data_.active_extruder);
+
+	if (!pre_data_.too_changing) {
+		current_position[E_AXIS] += 20;
+		line_to_current_position(5);
+		planner.synchronize();
+	}
 
 	// try to cut out filament
-	current_position[E_AXIS] -= 6;
-	line_to_current_position(50);
+	if (ModuleBase::toolhead() ==  MODULE_TOOLHEAD_DUALEXTRUDER)
+		current_position[E_AXIS] -= DUAL_EXTRUDER_RESUME_RETRACT_E_LENGTH;
+	else
+		current_position[E_AXIS] -= SINGLE_RESUME_RETRACT_E_LENGTH;
+	line_to_current_position(30);
 	planner.synchronize();
 
 	// E axis will be recovered in ResumeOver() using  cur_data_.PositionData[]
@@ -537,9 +578,30 @@ void PowerLossRecovery::ResumeLaser() {
 	// and there will check if cur_data_.laser_pwm is larger than 0
 	// So we recover the value to them
 	cur_data_.laser_pwm = pre_data_.laser_pwm;
+	cur_data_.laser_percent = pre_data_.laser_percent;
 
 	// just change laser power but not enable output
 	laser->SetPower(pre_data_.laser_percent);
+
+	if (MODULE_TOOLHEAD_LASER_20W == ModuleBase::toolhead() || MODULE_TOOLHEAD_LASER_40W == ModuleBase::toolhead()) {
+		if (MODULE_TOOLHEAD_LASER_40W == ModuleBase::toolhead())
+			laser->LaserBranchCtrl(!pre_data_.half_power_mode);
+		laser->SetAirPumpSwitch(pre_data_.air_pump_switch);
+		laser->SetCrossLightCAN(false);
+		float ox, oy;
+		if (E_SUCCESS == laser->GetCrossLightOffsetCAN(ox, oy)) {
+			LOG_I("PL: Set laser crosslight offset: %f, %f\n", ox, oy);
+			laser_crosslight_offset[X_AXIS] = ox;
+			laser_crosslight_offset[Y_AXIS] = oy;
+		}
+		else {
+			LOG_W("PL: Failed to get crosslight offset, work may be skewed!!!\n");
+		}
+	}
+
+	planner.laser_inline.status.isEnabled = pl_recovery.cur_data_.laser_inline_enable = pl_recovery.pre_data_.laser_inline_enable;
+	laser->SetOutputInline((uint16_t)0);
+	LOG_I("restore laser inline enable: %s\n", planner.laser_inline.status.isEnabled ? "ON" : "OFF");
 }
 
 
@@ -576,11 +638,22 @@ ErrCode PowerLossRecovery::ResumeWork() {
 		return E_NO_RESRC;
 	}
 
+	if (pre_data_.adapter != quick_change_adapter) {
+		LOG_E("quick_change_adapter mismatch, save adapter: %d, cur adapter: %d\n", pre_data_.adapter, quick_change_adapter);
+		return E_INVALID_STATE;
+	}
+
 	LOG_I("restore point: X:%.2f, Y: %.2f, Z: %.2f, B: %.2f, E: %.2f)\n", pre_data_.PositionData[X_AXIS], pre_data_.PositionData[Y_AXIS],
 			pre_data_.PositionData[Z_AXIS], pre_data_.PositionData[B_AXIS], pre_data_.PositionData[E_AXIS]);
 
 	switch (pre_data_.toolhead) {
 	case MODULE_TOOLHEAD_3DP:
+  case MODULE_TOOLHEAD_DUALEXTRUDER:
+    if (pre_data_.active_extruder >= EXTRUDERS) {
+      LOG_E("active extruder error\n");
+      return E_HARDWARE;
+    }
+
 		if (runout.is_filament_runout()) {
 			LOG_E("trigger RESTORE: failed, filament runout\n");
 			systemservice.SetSystemFaultBit(FAULT_FLAG_FILAMENT);
@@ -588,8 +661,10 @@ ErrCode PowerLossRecovery::ResumeWork() {
 			return E_NO_FILAMENT;
 		}
 
-		LOG_I("previous target temp: hotend: %d, bed: %d\n", pre_data_.HeaterTemp[0], pre_data_.BedTamp);
-
+		LOG_I("previous target temp: hotend 0: %d, bed: %d\n", pre_data_.HeaterTemp[0], pre_data_.BedTamp);
+    if (pre_data_.toolhead == MODULE_TOOLHEAD_DUALEXTRUDER) {
+      LOG_I("hotend 1: %d\n", pre_data_.HeaterTemp[1]);
+    }
 		Resume3DP();
 		break;
 
@@ -610,6 +685,8 @@ ErrCode PowerLossRecovery::ResumeWork() {
 
 	case MODULE_TOOLHEAD_LASER:
 	case MODULE_TOOLHEAD_LASER_10W:
+  case MODULE_TOOLHEAD_LASER_20W:
+  case MODULE_TOOLHEAD_LASER_40W:
 		if (enclosure.DoorOpened()) {
 			LOG_E("trigger RESTORE: failed, door is open\n");
 			return E_DOOR_OPENED;
@@ -617,6 +694,7 @@ ErrCode PowerLossRecovery::ResumeWork() {
 
 		LOG_I("previous recorded target Laser power is %.2f\n", pre_data_.laser_percent);
 		LOG_I("previous recorded target laser PWM is 0x%x\n", pre_data_.laser_pwm);
+		LOG_I("previous recorded laser inline enable: %d\n", pre_data_.laser_inline_enable);
 
 		ResumeLaser();
 		break;

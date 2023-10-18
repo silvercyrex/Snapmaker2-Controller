@@ -76,13 +76,14 @@ ErrCode Enclosure::Init(MAC_t &mac, uint8_t mac_index) {
 }
 
 ErrCode Enclosure::PostInit() {
-  if (IsOnline() && ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP) {
+  if (IsOnline() && (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP ||
+                      ModuleBase::toolhead() == MODULE_TOOLHEAD_DUALEXTRUDER)) {
     Disable();
   }
 
   // update the state of the door
   PollDoorState();
-  
+
   return E_SUCCESS;
 }
 
@@ -183,8 +184,12 @@ void Enclosure::Enable() {
 void Enclosure::HandleDoorOpened() {
   LOG_I("door opened!\n");
   systemservice.PauseTrigger(TRIGGER_SOURCE_DOOR_OPEN);
-  if (laser->IsOnline())
-    laser->SetPowerLimit(TOOLHEAD_LASER_POWER_SAFE_LIMIT);
+  if (laser->IsOnline()) {
+    if (MODULE_TOOLHEAD_LASER_20W == ModuleBase::toolhead() || MODULE_TOOLHEAD_LASER_40W == ModuleBase::toolhead())
+      laser->SetPowerLimit(TOOLHEAD_LASER_20W_40W_POWER_SAFE_LIMIT);
+    else
+      laser->SetPowerLimit(TOOLHEAD_LASER_POWER_SAFE_LIMIT);
+  }
 
   event_state_ = ENCLOSURE_EVENT_STATE_OPENED;
 }

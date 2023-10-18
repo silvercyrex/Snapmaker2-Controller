@@ -1,6 +1,6 @@
 /*
  * Snapmaker2-Controller Firmware
- * Copyright (C) 2019-2020 Snapmaker [https://github.com/Snapmaker]
+ * Copyright (C) 2019-2023 Snapmaker [https://github.com/Snapmaker]
  *
  * This file is part of Snapmaker2-Controller
  * (see https://github.com/Snapmaker/Snapmaker2-Controller)
@@ -18,17 +18,29 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
+
 #include "../common/config.h"
-#include "snapmaker.h"
-#include "src/inc/MarlinConfig.h"
-#include "src/gcode/gcode.h"
-#include HAL_PATH(src/HAL, HAL_watchdog_STM32F1.h)
+#include "../common/debug.h"
+#include "../service/system.h"
+#include "../module/toolhead_cnc.h"
+#include "../module/toolhead_laser.h"
 
+#include  "src/gcode/gcode.h"
 
-void GcodeSuite::M1999() {
-  SERIAL_ECHOLN("will reboot machine");
-  disable_power_domain(POWER_DOMAIN_ALL);
-  millis_t next_ms = millis() + 1000;
-  while (PENDING(millis(), next_ms));
-  nvic_sys_reset();
+#if (MOTHERBOARD == BOARD_SNAPMAKER_2_0)
+
+void GcodeSuite::M7_M8(const bool is_M8) {
+  if(MODULE_TOOLHEAD_LASER_20W == ModuleBase::toolhead() || MODULE_TOOLHEAD_LASER_40W == ModuleBase::toolhead()) {
+    planner.synchronize();   // Wait for move to arrive
+    laser->SetAirPumpSwitch(true);
+  }
 }
+
+void GcodeSuite::M9(void) {
+  if(MODULE_TOOLHEAD_LASER_20W == ModuleBase::toolhead() || MODULE_TOOLHEAD_LASER_40W == ModuleBase::toolhead()) {
+    planner.synchronize();   // Wait for move to arrive
+    laser->SetAirPumpSwitch(false);
+  }
+}
+
+#endif // MOTHERBOARD == BOARD_SNAPMAKER_2_0

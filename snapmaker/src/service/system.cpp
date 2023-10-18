@@ -26,6 +26,7 @@
 #include "../module/toolhead_3dp.h"
 #include "../module/toolhead_cnc.h"
 #include "../module/toolhead_laser.h"
+#include "../module/toolhead_dualextruder.h"
 
 #include "../snapmaker.h"
 
@@ -73,6 +74,12 @@ ErrCode SystemService::PauseTrigger(TriggerSource type)
     return E_NO_SWITCHING_STA;
   }
 
+  while (tool_changing) {
+    vTaskDelay(200);
+    need_pre_extrusion = false;
+    LOG_I("pause trigger: wait machine tool_change finish\n");
+  }
+
   // here the operations can be performed many times
   switch (type) {
   case TRIGGER_SOURCE_RUNOUT:
@@ -99,8 +106,12 @@ ErrCode SystemService::PauseTrigger(TriggerSource type)
     }
     break;
 
+  case TRIGGER_SOURCE_EXCEPTION:
+    LOG_W("pause by exception!\n");
+    break;
+
   default:
-    LOG_W("invlaid trigger source： %d\n", type);
+    LOG_W("invlaid trigger source: %d\n", type);
     return E_PARAM;
     break;
   }
@@ -134,7 +145,7 @@ ErrCode SystemService::PreProcessStop() {
   feedrate_percentage = 100;
 
   // set temp to 0
-  if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP) {
+  if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP || ModuleBase::toolhead() == MODULE_TOOLHEAD_DUALEXTRUDER) {
     thermalManager.setTargetBed(0);
     HOTEND_LOOP() { thermalManager.setTargetHotend(0, e); }
 
@@ -148,11 +159,21 @@ ErrCode SystemService::PreProcessStop() {
 
   print_job_timer.stop();
 
-  if ((ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER) || (ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_10W)) {
+  if ((ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER) ||
+      (ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_10W) ||
+      (ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_20W) ||
+      (ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_40W)
+  ) {
     laser->TurnOff();
+    laser->SetAirPumpSwitch(false, false);
     is_waiting_gcode = false;
     is_laser_on = false;
   }
+
+  // always reset the laser crosslight offset
+  laser_crosslight_offset[X_AXIS] = INVALID_OFFSET;
+  laser_crosslight_offset[Y_AXIS] = INVALID_OFFSET;
+
   gocde_pack_start_line(0);
   return E_SUCCESS;
 }
@@ -276,14 +297,20 @@ void inline SystemService::RestoreXYZ(void) {
 }
 
 void inline SystemService::resume_3dp(void) {
-	current_position[E_AXIS] += 20;
-	line_to_current_position(5);
-	planner.synchronize();
+  if (need_pre_extrusion) {
+    current_position[E_AXIS] += 20;
+    line_to_current_position(5);
+    planner.synchronize();
 
-	// try to cut out filament
-	current_position[E_AXIS] -= 6;
-	line_to_current_position(50);
-	planner.synchronize();
+    // try to cut out filament
+    if (ModuleBase::toolhead() == MODULE_TOOLHEAD_DUALEXTRUDER)
+      current_position[E_AXIS] -= DUAL_EXTRUDER_RESUME_RETRACT_E_LENGTH;
+    else
+      current_position[E_AXIS] -= SINGLE_RESUME_RETRACT_E_LENGTH;
+    line_to_current_position(50);
+    planner.synchronize();
+  }
+  need_pre_extrusion = true;
 }
 
 
@@ -294,7 +321,21 @@ void inline SystemService::resume_cnc(void) {
 }
 
 void inline SystemService::resume_laser(void) {
-
+  planner.laser_inline.status.isEnabled = pl_recovery.cur_data_.laser_inline_enable;
+  LOG_I("resume laser inline enable: %s\n", planner.laser_inline.status.isEnabled ? "ON" : "OFF");
+  if (MODULE_TOOLHEAD_LASER_20W == ModuleBase::toolhead() || MODULE_TOOLHEAD_LASER_40W == ModuleBase::toolhead()) {
+    laser->SetAirPumpSwitch(pl_recovery.cur_data_.air_pump_switch);
+    laser->SetCrossLightCAN(false);
+    float ox, oy;
+    if (E_SUCCESS == laser->GetCrossLightOffsetCAN(ox, oy)) {
+      LOG_I("Set laser crosslight offset: %f, %f\n", ox, oy);
+      laser_crosslight_offset[X_AXIS] = ox;
+      laser_crosslight_offset[Y_AXIS] = oy;
+    }
+    else {
+      LOG_W("Failed to get crosslight offset, work may be skewed!!!\n");
+    }
+  }
 }
 
 /**
@@ -339,6 +380,7 @@ ErrCode SystemService::ResumeTrigger(TriggerSource source) {
 
   switch (ModuleBase::toolhead()) {
   case MODULE_TOOLHEAD_3DP:
+  case MODULE_TOOLHEAD_DUALEXTRUDER:
     if (runout.is_filament_runout()) {
       LOG_E("No filemant!\n");
       fault_flag_ |= FAULT_FLAG_FILAMENT;
@@ -349,6 +391,8 @@ ErrCode SystemService::ResumeTrigger(TriggerSource source) {
   case MODULE_TOOLHEAD_CNC:
   case MODULE_TOOLHEAD_LASER:
   case MODULE_TOOLHEAD_LASER_10W:
+  case MODULE_TOOLHEAD_LASER_20W:
+  case MODULE_TOOLHEAD_LASER_40W:
     if (enclosure.DoorOpened()) {
       LOG_E("Door is opened!\n");
       fault_flag_ |= FAULT_FLAG_DOOR_OPENED;
@@ -373,6 +417,7 @@ ErrCode SystemService::ResumeTrigger(TriggerSource source) {
 ErrCode SystemService::ResumeProcess() {
   switch(ModuleBase::toolhead()) {
   case MODULE_TOOLHEAD_3DP:
+  case MODULE_TOOLHEAD_DUALEXTRUDER:
     set_bed_leveling_enabled(true);
     resume_3dp();
     break;
@@ -383,6 +428,8 @@ ErrCode SystemService::ResumeProcess() {
 
   case MODULE_TOOLHEAD_LASER:
   case MODULE_TOOLHEAD_LASER_10W:
+  case MODULE_TOOLHEAD_LASER_20W:
+  case MODULE_TOOLHEAD_LASER_40W:
     resume_laser();
     break;
 
@@ -428,14 +475,18 @@ ErrCode SystemService::ResumeOver() {
 
   switch (ModuleBase::toolhead()) {
   case MODULE_TOOLHEAD_3DP:
+  case MODULE_TOOLHEAD_DUALEXTRUDER:
     if (runout.is_filament_runout()) {
       LOG_E("No filemant! Please insert filemant!\n");
       PauseTrigger(TRIGGER_SOURCE_RUNOUT);
       return E_NO_FILAMENT;
     }
     // filament has been retracted for 6mm in resume process
-    // we pre-extruder 6.5 to get better print quality
-    current_position[E_AXIS] += 6.5;
+    // we pre-extruder 6.2 to get better print quality
+    if (ModuleBase::toolhead() == MODULE_TOOLHEAD_DUALEXTRUDER)
+      current_position[E_AXIS] += (DUAL_EXTRUDER_RESUME_RETRACT_E_LENGTH + 0.2);
+    else
+      current_position[E_AXIS] += (SINGLE_RESUME_RETRACT_E_LENGTH + 0.2);
     line_to_current_position(5);
     planner.synchronize();
     current_position[E_AXIS] = pl_recovery.cur_data_.PositionData[E_AXIS];
@@ -445,13 +496,19 @@ ErrCode SystemService::ResumeOver() {
   case MODULE_TOOLHEAD_CNC:
   case MODULE_TOOLHEAD_LASER:
   case MODULE_TOOLHEAD_LASER_10W:
+  case MODULE_TOOLHEAD_LASER_20W:
+  case MODULE_TOOLHEAD_LASER_40W:
     if (enclosure.DoorOpened()) {
       LOG_E("Door is opened, please close the door!\n");
       PauseTrigger(TRIGGER_SOURCE_DOOR_OPEN);
       return E_DOOR_OPENED;
     }
 
-    if ((MODULE_TOOLHEAD_LASER == ModuleBase::toolhead()) || (MODULE_TOOLHEAD_LASER_10W == ModuleBase::toolhead())) {
+    if ((ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER) ||
+        (ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_10W) ||
+        (ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_20W) ||
+        (ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_40W)
+    ) {
       if (pl_recovery.cur_data_.laser_pwm > 0)
         laser->TurnOn();
     }
@@ -596,6 +653,7 @@ ErrCode SystemService::StartWork(TriggerSource s) {
 
   switch (ModuleBase::toolhead()) {
   case MODULE_TOOLHEAD_3DP:
+  case MODULE_TOOLHEAD_DUALEXTRUDER:
     if (runout.is_filament_runout()) {
       fault_flag_ |= FAULT_FLAG_FILAMENT;
       LOG_E("No filemant!\n");
@@ -605,8 +663,23 @@ ErrCode SystemService::StartWork(TriggerSource s) {
 
   case MODULE_TOOLHEAD_LASER:
   case MODULE_TOOLHEAD_LASER_10W:
+  case MODULE_TOOLHEAD_LASER_20W:
+  case MODULE_TOOLHEAD_LASER_40W:
     is_laser_on = false;
     is_waiting_gcode = false;
+    if (MODULE_TOOLHEAD_LASER_20W == ModuleBase::toolhead() || MODULE_TOOLHEAD_LASER_40W == ModuleBase::toolhead()) {
+      laser->SetCrossLightCAN(false);
+      float ox, oy;
+      if (E_SUCCESS == laser->GetCrossLightOffsetCAN(ox, oy)) {
+        LOG_I("StartWork: Set laser crosslight offset: %f, %f\n", ox, oy);
+        laser_crosslight_offset[X_AXIS] = ox;
+        laser_crosslight_offset[Y_AXIS] = oy;
+      }
+      else {
+        LOG_W("StartWork: Failed to get crosslight offset, work may be skewed!!!\n");
+      }
+    }
+
   case MODULE_TOOLHEAD_CNC:
     if (enclosure.DoorOpened()) {
       fault_flag_ |= FAULT_FLAG_DOOR_OPENED;
@@ -681,7 +754,7 @@ void SystemService::CheckException() {
 /**
  * Use to throw a excetion, system will handle it, and return to Screen
  */
-ErrCode SystemService::ThrowException(ExceptionHost h, ExceptionType t) {
+ErrCode SystemService::ThrowException(const ExceptionHost h, const ExceptionType t) {
   uint8_t action = EACTION_NONE;
   uint8_t action_ban = ACTION_BAN_NONE;
   uint8_t power_ban = POWER_DOMAIN_NONE;
@@ -768,7 +841,7 @@ ErrCode SystemService::ThrowException(ExceptionHost h, ExceptionType t) {
     if (fault_flag_ & FAULT_FLAG_BED_PORT)
       return E_SAME_STATE;
     new_fault_flag = FAULT_FLAG_BED_PORT;
-    if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP)
+    if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP || ModuleBase::toolhead() == MODULE_TOOLHEAD_DUALEXTRUDER)
       action = EACTION_STOP_WORKING | EACTION_STOP_HEATING_BED;
     action_ban |= ACTION_BAN_NO_HEATING_BED;
     power_ban = POWER_DOMAIN_BED;
@@ -784,24 +857,21 @@ ErrCode SystemService::ThrowException(ExceptionHost h, ExceptionType t) {
     break;
 
   case ETYPE_HEAT_FAIL:
-    if (ModuleBase::toolhead() != MODULE_TOOLHEAD_3DP)
+    if (ModuleBase::toolhead() != MODULE_TOOLHEAD_3DP && ModuleBase::toolhead() != MODULE_TOOLHEAD_DUALEXTRUDER)
       return E_SUCCESS;
     switch (h) {
     case EHOST_HOTEND0:
-      if (fault_flag_ & FAULT_FLAG_HOTEND_HEATFAIL)
-        return E_SAME_STATE;
+    case EHOST_HOTEND1:
       new_fault_flag = FAULT_FLAG_HOTEND_HEATFAIL;
       action = EACTION_STOP_WORKING | EACTION_STOP_HEATING_HOTEND;
-      LOG_E("heating failed for hotend, please check heating module & sensor! temp: %.2f / %d\n",
-        thermalManager.degHotend(0), thermalManager.degTargetHotend(0));
+      LOG_E("heating failed for hotend[%u] temp: %.2f / %d\n", h,
+        thermalManager.degHotend(h), thermalManager.degTargetHotend(h));
       break;
 
     case EHOST_BED:
-      if (fault_flag_ & FAULT_FLAG_BED_HEATFAIL)
-        return E_SAME_STATE;
       new_fault_flag = FAULT_FLAG_BED_HEATFAIL;
       action = EACTION_STOP_WORKING | EACTION_STOP_HEATING_BED;
-      LOG_E("heating failed for bed, please check heating module & sensor! temp: %.2f / %d\n",
+      LOG_E("heating failed for bed! temp: %.2f / %d\n",
         thermalManager.degBed(), thermalManager.degTargetBed());
       break;
 
@@ -813,15 +883,14 @@ ErrCode SystemService::ThrowException(ExceptionHost h, ExceptionType t) {
     break;
 
   case ETYPE_TEMP_RUNAWAY:
-    if (ModuleBase::toolhead() != MODULE_TOOLHEAD_3DP)
+    if (ModuleBase::toolhead() != MODULE_TOOLHEAD_3DP && ModuleBase::toolhead() != MODULE_TOOLHEAD_DUALEXTRUDER)
       return E_SUCCESS;
     switch (h) {
     case EHOST_HOTEND0:
-      if (fault_flag_ & FAULT_FLAG_HOTEND_RUNWAWY)
-        return E_SAME_STATE;
+    case EHOST_HOTEND1:
       new_fault_flag = FAULT_FLAG_HOTEND_RUNWAWY;
       action = EACTION_STOP_WORKING | EACTION_STOP_HEATING_BED | EACTION_STOP_HEATING_HOTEND;
-      LOG_E("thermal run away of hotend! temp: %.2f / %d\n", thermalManager.degHotend(0), thermalManager.degTargetHotend(0));
+      LOG_E("thermal run away of hotend[%u]! temp: %.2f / %d\n", h, thermalManager.degHotend(h), thermalManager.degTargetHotend(h));
       break;
 
     case EHOST_BED:
@@ -841,7 +910,7 @@ ErrCode SystemService::ThrowException(ExceptionHost h, ExceptionType t) {
     break;
 
   case ETYPE_TEMP_REDUNDANCY:
-    if (ModuleBase::toolhead() != MODULE_TOOLHEAD_3DP)
+    if (ModuleBase::toolhead() != MODULE_TOOLHEAD_3DP  && ModuleBase::toolhead() != MODULE_TOOLHEAD_DUALEXTRUDER)
       return E_SUCCESS;
     LOG_E("Not handle exception: TEMP_REDUNDANCY\n");
     return E_FAILURE;
@@ -850,23 +919,20 @@ ErrCode SystemService::ThrowException(ExceptionHost h, ExceptionType t) {
   case ETYPE_SENSOR_BAD:
     switch (h) {
     case EHOST_HOTEND0:
-      if (ModuleBase::toolhead() != MODULE_TOOLHEAD_3DP)
+    case EHOST_HOTEND1:
+      if (ModuleBase::toolhead() != MODULE_TOOLHEAD_3DP  && ModuleBase::toolhead() != MODULE_TOOLHEAD_DUALEXTRUDER)
         return E_SUCCESS;
-      if (fault_flag_ & FAULT_FLAG_HOTEND_SENSOR_BAD)
-        return E_SAME_STATE;
       new_fault_flag = FAULT_FLAG_HOTEND_SENSOR_BAD;
       action = EACTION_STOP_WORKING | EACTION_STOP_HEATING_BED | EACTION_STOP_HEATING_HOTEND;
       action_ban |= (ACTION_BAN_NO_WORKING | ACTION_BAN_NO_HEATING_HOTEND);
-      LOG_E("Detected error in sensor of Hotend! temp: %.2f / %d\n", thermalManager.degHotend(0), thermalManager.degTargetHotend(0));
+      LOG_E("Detected error in sensor of Hotend[%u]! temp: %.2f / %d\n", h, thermalManager.degHotend(h), thermalManager.degTargetHotend(h));
       break;
 
     case EHOST_BED:
-      if (fault_flag_ & FAULT_FLAG_BED_SENSOR_BAD)
-        return E_SAME_STATE;
       new_fault_flag = FAULT_FLAG_BED_SENSOR_BAD;
       action = EACTION_STOP_HEATING_BED;
       action_ban = ACTION_BAN_NO_HEATING_BED;
-      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP) {
+      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP || ModuleBase::toolhead() == MODULE_TOOLHEAD_DUALEXTRUDER) {
         action |= EACTION_STOP_WORKING;
         LOG_E("Detected error in sensor of Bed! temp: %.2f / %d\n", thermalManager.degBed(), thermalManager.degTargetBed());
       }
@@ -880,7 +946,7 @@ ErrCode SystemService::ThrowException(ExceptionHost h, ExceptionType t) {
     break;
 
   case ETYPE_BELOW_MINTEMP:
-    if (ModuleBase::toolhead() != MODULE_TOOLHEAD_3DP)
+    if (ModuleBase::toolhead() != MODULE_TOOLHEAD_3DP  && ModuleBase::toolhead() != MODULE_TOOLHEAD_DUALEXTRUDER)
       return E_SUCCESS;
     LOG_E("Not handle exception: BELOW_MINTEMP\n");
     return E_FAILURE;
@@ -889,22 +955,20 @@ ErrCode SystemService::ThrowException(ExceptionHost h, ExceptionType t) {
   case ETYPE_OVERRUN_MAXTEMP:
     switch (h) {
     case EHOST_HOTEND0:
-      if (fault_flag_ & FAULT_FLAG_HOTEND_MAXTEMP)
-        return E_SAME_STATE;
+    case EHOST_HOTEND1:
       new_fault_flag = FAULT_FLAG_HOTEND_MAXTEMP;
-      action = EACTION_STOP_HEATING_HOTEND;
-      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP) {
-        action |= EACTION_STOP_WORKING;
-      }
-      LOG_E("current temp of hotend is higher than MAXTEMP: %d!\n", HEATER_0_MAXTEMP);
+      action = EACTION_STOP_HEATING_HOTEND | EACTION_STOP_WORKING;
+      action_ban = ACTION_BAN_NO_HEATING_HOTEND | ACTION_BAN_NO_WORKING | ACTION_BAN_NO_MOVING;
+      power_disable = POWER_DOMAIN_HOTEND;
+      power_ban = POWER_DOMAIN_HOTEND;
+      LOG_E("temp [%.1f] of hotend[%u] is higher than MAXTEMP: %d!\n", printer1->GetTemp(h)/10.0, h,
+        thermalManager.temp_range[h].maxtemp);
       break;
 
     case EHOST_BED:
-      if (fault_flag_ & FAULT_FLAG_BED_MAXTEMP)
-        return E_SAME_STATE;
       new_fault_flag = FAULT_FLAG_BED_MAXTEMP;
       action = EACTION_STOP_HEATING_BED;
-      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP) {
+      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP || ModuleBase::toolhead() == MODULE_TOOLHEAD_DUALEXTRUDER) {
         action |= EACTION_STOP_WORKING;
       }
       LOG_E("current temp of Bed is higher than MAXTEMP: %d!\n", BED_MAXTEMP);
@@ -920,32 +984,20 @@ ErrCode SystemService::ThrowException(ExceptionHost h, ExceptionType t) {
   case ETYPE_OVERRUN_MAXTEMP_AGAIN:
     switch (h) {
     case EHOST_HOTEND0:
-      if (fault_flag_ & FAULT_FLAG_HOTEND_SHORTCIRCUIT)
-        return E_SAME_STATE;
-      new_fault_flag = FAULT_FLAG_HOTEND_SHORTCIRCUIT;
-      action = EACTION_STOP_HEATING_HOTEND;
-      action_ban = ACTION_BAN_NO_HEATING_HOTEND;
-      power_disable = POWER_DOMAIN_HOTEND;
-      power_ban = POWER_DOMAIN_HOTEND;
-      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP) {
-        action |= EACTION_STOP_WORKING;
-        action_ban |= ACTION_BAN_NO_WORKING | ACTION_BAN_NO_MOVING;
-      }
-      LOG_E("current temp [%.2f] of hotend is more higher than MAXTEMP: %d!\n", thermalManager.degHotend(0), HEATER_0_MAXTEMP + 10);
+    case EHOST_HOTEND1:
+      LOG_E("won't handle MAXTEMP_AGAIN with hotend[%u], temp[%.1f]\n", h, thermalManager.degHotend(h));
       break;
 
     case EHOST_BED:
-      if (fault_flag_ & FAULT_FLAG_BED_SHORTCIRCUIT)
-        return E_SAME_STATE;
       new_fault_flag = FAULT_FLAG_BED_SHORTCIRCUIT;
       action = EACTION_STOP_HEATING_BED;
       action_ban = ACTION_BAN_NO_HEATING_BED;
       power_disable = POWER_DOMAIN_BED;
       power_ban = POWER_DOMAIN_BED;
-      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP) {
+      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP || ModuleBase::toolhead() == MODULE_TOOLHEAD_DUALEXTRUDER) {
         action |= EACTION_STOP_WORKING;
       }
-      LOG_E("current temp [%.2f] of Bed is more higher than MAXTEMP: %d!\n", thermalManager.degBed(), BED_MAXTEMP + 5);
+      LOG_E("temp [%.1f] of Bed is more higher than MAXTEMP: %d!\n", thermalManager.degBed(), BED_MAXTEMP + 5);
       break;
 
     default:
@@ -958,25 +1010,22 @@ ErrCode SystemService::ThrowException(ExceptionHost h, ExceptionType t) {
   case ETYPE_ABRUPT_TEMP_DROP:
     switch (h) {
     case EHOST_HOTEND0:
-      if (fault_flag_ & FAULT_FLAG_HOTEND_SENSOR_COMEOFF)
-        return E_SAME_STATE;
+    case EHOST_HOTEND1:
       new_fault_flag = FAULT_FLAG_HOTEND_SENSOR_COMEOFF;
       action = EACTION_STOP_HEATING_HOTEND;
       action_ban = ACTION_BAN_NO_HEATING_HOTEND;
-      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP) {
+      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP || ModuleBase::toolhead() == MODULE_TOOLHEAD_DUALEXTRUDER) {
         action |= EACTION_STOP_WORKING;
         action_ban |= ACTION_BAN_NO_WORKING;
       }
-      LOG_E("temperature of hotend dropped abruptly! temp: %.2f / %d\n", thermalManager.degHotend(0), thermalManager.degTargetHotend(0));
+      LOG_E("temperature of hotend[%u] dropped abruptly! temp: %.2f / %d\n", h, thermalManager.degHotend(h), thermalManager.degTargetHotend(h));
       break;
 
     case EHOST_BED:
-      if (fault_flag_ & FAULT_FLAG_BED_SENSOR_COMEOFF)
-        return E_SAME_STATE;
       new_fault_flag = FAULT_FLAG_BED_SENSOR_COMEOFF;
       action = EACTION_STOP_HEATING_BED;
       action_ban = ACTION_BAN_NO_HEATING_BED;
-      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP) {
+      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP || ModuleBase::toolhead() == MODULE_TOOLHEAD_DUALEXTRUDER) {
         action |= EACTION_STOP_WORKING;
       }
       LOG_E("current temperature of bed dropped abruptly! temp: %.2f / %d\n", thermalManager.degBed(), thermalManager.degTargetBed());
@@ -992,25 +1041,22 @@ ErrCode SystemService::ThrowException(ExceptionHost h, ExceptionType t) {
   case ETYPE_SENSOR_COME_OFF:
     switch (h) {
     case EHOST_HOTEND0:
-      if (fault_flag_ & FAULT_FLAG_HOTEND_SENSOR_COMEOFF)
-        return E_SAME_STATE;
+    case EHOST_HOTEND1:
       new_fault_flag = FAULT_FLAG_HOTEND_SENSOR_COMEOFF;
       action = EACTION_STOP_HEATING_HOTEND;
       action_ban = ACTION_BAN_NO_HEATING_HOTEND;
-      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP) {
+      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP || ModuleBase::toolhead() == MODULE_TOOLHEAD_DUALEXTRUDER) {
         action |= EACTION_STOP_WORKING;
         action_ban |= ACTION_BAN_NO_WORKING;
       }
-      LOG_E("Thermistor of hotend maybe come off! temp: %.2f / %d\n", thermalManager.degHotend(0), thermalManager.degTargetHotend(0));
+      LOG_E("Thermistor of hotend[%u] maybe come off! temp: %.2f / %d\n", h, thermalManager.degHotend(h), thermalManager.degTargetHotend(h));
       break;
 
     case EHOST_BED:
-      if (fault_flag_ & FAULT_FLAG_BED_SENSOR_COMEOFF)
-        return E_SAME_STATE;
       new_fault_flag = FAULT_FLAG_BED_SENSOR_COMEOFF;
       action = EACTION_STOP_HEATING_BED;
       action_ban = ACTION_BAN_NO_HEATING_BED;
-      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP) {
+      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP || ModuleBase::toolhead() == MODULE_TOOLHEAD_DUALEXTRUDER) {
         action |= EACTION_STOP_WORKING;
       }
       LOG_E("Thermistor of bed maybe come off! temp: %.2f / %d\n", thermalManager.degBed(), thermalManager.degTargetBed());
@@ -1020,6 +1066,25 @@ ErrCode SystemService::ThrowException(ExceptionHost h, ExceptionType t) {
       LOG_E("Exception [%d] happened with unknown Host [%d]\n", t, h);
       return E_FAILURE;
       break;
+    }
+    break;
+
+  case ETYPE_3DP2E_EXTRUDER_MISMATCH:
+    if (h == EHOST_EXECUTOR) {
+      LOG_E("active extruder mismatch target: %u!\n", active_extruder);
+      new_fault_flag = FAULT_FLAG_3DP2E_EXTRUDER_MISMATCH;
+      // for now didn't handle this exception
+      // action = EACTION_STOP_HEATING_HOTEND | EACTION_PAUSE_WORKING;
+      // action_ban = ACTION_BAN_NO_HEATING_HOTEND | ACTION_BAN_NO_WORKING;
+    }
+    break;
+
+  case ETYPE_3DP2E_UNKNOWN_NOZZLE:
+    if (h == EHOST_EXECUTOR) {
+      LOG_E("detect unknown nozzle!\n");
+      new_fault_flag = FAULT_FLAG_3DP2E_UNKNOWN_NOZZLE;
+      action = EACTION_STOP_HEATING_HOTEND | EACTION_PAUSE_WORKING;
+      action_ban = ACTION_BAN_NO_HEATING_HOTEND | ACTION_BAN_NO_WORKING;
     }
     break;
 
@@ -1052,6 +1117,9 @@ ErrCode SystemService::ThrowException(ExceptionHost h, ExceptionType t) {
     PauseTrigger(TRIGGER_SOURCE_EXCEPTION);
   }
 
+  if (fault_flag_ & new_fault_flag)
+    return E_SAME_STATE;
+
   fault_flag_ |= new_fault_flag;
   SendException(fault_flag_);
 
@@ -1059,7 +1127,7 @@ ErrCode SystemService::ThrowException(ExceptionHost h, ExceptionType t) {
 }
 
 
-ErrCode SystemService::ThrowExceptionISR(ExceptionHost h, ExceptionType t) {
+ErrCode SystemService::ThrowExceptionISR(const ExceptionHost h, const ExceptionType t) {
   if (isr_e_len_ >= EXCEPTION_ISR_BUFFSER_SIZE)
     return E_NO_RESRC;
 
@@ -1075,7 +1143,7 @@ ErrCode SystemService::ThrowExceptionISR(ExceptionHost h, ExceptionType t) {
 }
 
 
-ErrCode SystemService::ClearException(ExceptionHost h, ExceptionType t) {
+ErrCode SystemService::ClearException(const ExceptionHost h, const ExceptionType t) {
   uint8_t action_ban = ACTION_BAN_NONE;
   uint8_t power_ban = POWER_DOMAIN_NONE;
 
@@ -1172,6 +1240,7 @@ ErrCode SystemService::ClearException(ExceptionHost h, ExceptionType t) {
   case ETYPE_HEAT_FAIL:
     switch (h) {
     case EHOST_HOTEND0:
+    case EHOST_HOTEND1:
       if (!(fault_flag_ & FAULT_FLAG_HOTEND_HEATFAIL))
         return E_INVALID_STATE;
       fault_flag_ &= ~FAULT_FLAG_HOTEND_HEATFAIL;
@@ -1193,6 +1262,7 @@ ErrCode SystemService::ClearException(ExceptionHost h, ExceptionType t) {
   case ETYPE_TEMP_RUNAWAY:
     switch (h) {
     case EHOST_HOTEND0:
+    case EHOST_HOTEND1:
       if (!(fault_flag_ & FAULT_FLAG_HOTEND_RUNWAWY))
         return E_INVALID_STATE;
       fault_flag_ &= ~FAULT_FLAG_HOTEND_RUNWAWY;
@@ -1218,6 +1288,7 @@ ErrCode SystemService::ClearException(ExceptionHost h, ExceptionType t) {
   case ETYPE_SENSOR_BAD:
     switch (h) {
     case EHOST_HOTEND0:
+    case EHOST_HOTEND1:
       if (!(fault_flag_ & FAULT_FLAG_HOTEND_SENSOR_BAD))
         return E_INVALID_STATE;
       fault_flag_ &= ~FAULT_FLAG_HOTEND_SENSOR_BAD;
@@ -1247,10 +1318,16 @@ ErrCode SystemService::ClearException(ExceptionHost h, ExceptionType t) {
   case ETYPE_OVERRUN_MAXTEMP:
     switch (h) {
     case EHOST_HOTEND0:
-      if (!(fault_flag_ & FAULT_FLAG_HOTEND_MAXTEMP))
+    case EHOST_HOTEND1:
+      if (!(fault_flag_ & FAULT_FLAG_HOTEND_SHORTCIRCUIT))
         return E_SAME_STATE;
-      fault_flag_ &= ~FAULT_FLAG_HOTEND_MAXTEMP;
-      LOG_I("current temp of hotend is lower than MAXTEMP!\n");
+      fault_flag_ &= ~FAULT_FLAG_HOTEND_SHORTCIRCUIT;
+      action_ban = ACTION_BAN_NO_HEATING_HOTEND;
+      power_ban = POWER_DOMAIN_HOTEND;
+      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP || ModuleBase::toolhead() == MODULE_TOOLHEAD_DUALEXTRUDER) {
+        action_ban |= ACTION_BAN_NO_WORKING | ACTION_BAN_NO_MOVING;
+      }
+      LOG_I("current temp of hotend is now lower than MAX TEMP: %d!\n", HEATER_0_MAXTEMP);
       break;
 
     case EHOST_BED:
@@ -1270,15 +1347,8 @@ ErrCode SystemService::ClearException(ExceptionHost h, ExceptionType t) {
   case ETYPE_OVERRUN_MAXTEMP_AGAIN:
     switch (h) {
     case EHOST_HOTEND0:
-      if (!(fault_flag_ & FAULT_FLAG_HOTEND_SHORTCIRCUIT))
-        return E_SAME_STATE;
-      fault_flag_ &= ~FAULT_FLAG_HOTEND_SHORTCIRCUIT;
-      action_ban = ACTION_BAN_NO_HEATING_HOTEND;
-      power_ban = POWER_DOMAIN_HOTEND;
-      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP) {
-        action_ban |= ACTION_BAN_NO_WORKING | ACTION_BAN_NO_MOVING;
-      }
-      LOG_I("current temp of hotend is now lower than MAX TEMP: %d!\n", HEATER_0_MAXTEMP);
+    case EHOST_HOTEND1:
+      LOG_I("not handle MAXTEMP_AGAIN with hotend!\n");
       break;
 
     case EHOST_BED:
@@ -1300,11 +1370,12 @@ ErrCode SystemService::ClearException(ExceptionHost h, ExceptionType t) {
   case ETYPE_ABRUPT_TEMP_DROP:
     switch (h) {
     case EHOST_HOTEND0:
+    case EHOST_HOTEND1:
       if (!(fault_flag_ & FAULT_FLAG_HOTEND_SENSOR_COMEOFF))
         return E_SAME_STATE;
       fault_flag_ &= ~FAULT_FLAG_HOTEND_SENSOR_COMEOFF;
       action_ban = ACTION_BAN_NO_HEATING_HOTEND;
-      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP) {
+      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP || ModuleBase::toolhead() == MODULE_TOOLHEAD_DUALEXTRUDER) {
         action_ban |= ACTION_BAN_NO_WORKING;
       }
       LOG_I("abrupt temperature drop in hotend recover.\n");
@@ -1328,11 +1399,12 @@ ErrCode SystemService::ClearException(ExceptionHost h, ExceptionType t) {
   case ETYPE_SENSOR_COME_OFF:
     switch (h) {
     case EHOST_HOTEND0:
+    case EHOST_HOTEND1:
       if (!(fault_flag_ & FAULT_FLAG_HOTEND_SENSOR_COMEOFF))
         return E_SAME_STATE;
       fault_flag_ &= ~FAULT_FLAG_HOTEND_SENSOR_COMEOFF;
       action_ban = ACTION_BAN_NO_HEATING_HOTEND;
-      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP) {
+      if (ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP || ModuleBase::toolhead() == MODULE_TOOLHEAD_DUALEXTRUDER) {
         action_ban |= ACTION_BAN_NO_WORKING;
       }
       LOG_I("fault of HOTEND SENSOR COME OFF is cleared!\n");
@@ -1350,6 +1422,22 @@ ErrCode SystemService::ClearException(ExceptionHost h, ExceptionType t) {
       LOG_E("Exception [%d] happened with unknown Host [%d]\n", t, h);
       return E_FAILURE;
       break;
+    }
+    break;
+
+  case ETYPE_3DP2E_EXTRUDER_MISMATCH:
+    if (h == EHOST_EXECUTOR) {
+      LOG_I("clear extruder mismatch error!\n");
+      fault_flag_ &= ~FAULT_FLAG_3DP2E_EXTRUDER_MISMATCH;
+      action_ban = ACTION_BAN_NO_WORKING | ACTION_BAN_NO_HEATING_HOTEND;
+    }
+    break;
+
+  case ETYPE_3DP2E_UNKNOWN_NOZZLE:
+    if (h == EHOST_EXECUTOR) {
+      LOG_I("clear nozzle unknown error!\n");
+      fault_flag_ &= ~FAULT_FLAG_3DP2E_UNKNOWN_NOZZLE;
+      action_ban = ACTION_BAN_NO_WORKING | ACTION_BAN_NO_HEATING_HOTEND;
     }
     break;
 
@@ -1474,6 +1562,16 @@ void SystemService::MapFaultFlagToException(uint32_t flag, ExceptionHost &host, 
   case FAULT_FLAG_UNKNOW_MODEL:
     host = EHOST_MC;
     type = ETYPE_NO_HOST;
+    break;
+
+  case FAULT_FLAG_3DP2E_EXTRUDER_MISMATCH:
+    host = EHOST_EXECUTOR;
+    type = ETYPE_3DP2E_EXTRUDER_MISMATCH;
+    break;
+
+  case FAULT_FLAG_3DP2E_UNKNOWN_NOZZLE:
+    host = EHOST_EXECUTOR;
+    type = ETYPE_3DP2E_UNKNOWN_NOZZLE;
     break;
 
   default:
@@ -1668,7 +1766,10 @@ ErrCode SystemService::SendStatus(SSTP_Event_t &event) {
   tmp_i16 = (int16_t)tmp_f32;
   HWORD_TO_PDU_BYTES_INDE_MOVE(buff, tmp_i16, i);
 
-  if (ModuleBase::toolhead() == MACHINE_TYPE_LASER || ModuleBase::toolhead() == MACHINE_TYPE_LASER_10W) {
+  if (ModuleBase::toolhead() == MACHINE_TYPE_LASER ||
+      ModuleBase::toolhead() == MACHINE_TYPE_LASER_10W ||
+      ModuleBase::toolhead() == MACHINE_TYPE_LASER_20W ||
+      ModuleBase::toolhead() == MACHINE_TYPE_LASER_40W) {
     // laser power
     tmp_u32 = (uint32_t)(laser->power() * 1000);
   } else if (ModuleBase::toolhead() == MACHINE_TYPE_CNC) {
@@ -1699,6 +1800,15 @@ ErrCode SystemService::SendStatus(SSTP_Event_t &event) {
     tmp_u32 = 0;
   }
   WORD_TO_PDU_BYTES_INDEX_MOVE(buff, tmp_u32, i);
+
+  if (MODULE_TOOLHEAD_DUALEXTRUDER == ModuleBase::toolhead()) {
+    // temperatures of extruder1 hotend
+    tmp_i16 = (int16_t)thermalManager.degHotend(1);
+    HWORD_TO_PDU_BYTES_INDE_MOVE(buff, tmp_i16, i);
+    tmp_i16 = (int16_t)thermalManager.degTargetHotend(1);
+    HWORD_TO_PDU_BYTES_INDE_MOVE(buff, tmp_i16, i);
+  }
+
   return hmi.Send(event);
 }
 #endif
@@ -1724,7 +1834,10 @@ ErrCode SystemService::SendException(uint32_t fault) {
 }
 
 ErrCode SystemService::SendSecurityStatus () {
-  if (ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_10W) {
+  if ((ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_10W) ||
+      (ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_20W) ||
+      (ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_40W)
+  ) {
     laser->SendSecurityStatus();
   }
 
@@ -1750,6 +1863,7 @@ ErrCode SystemService::ChangeSystemStatus(SSTP_Event_t &event) {
   case SYSCTL_OPC_START_WORK:
     LOG_I("SC req START work\n");
     err = StartWork(TRIGGER_SOURCE_SC);
+    need_pre_extrusion = true;
     if (err == E_SUCCESS)
       current_line_ = 0;
     break;
@@ -1770,6 +1884,7 @@ ErrCode SystemService::ChangeSystemStatus(SSTP_Event_t &event) {
     }
     else {
       err = ResumeProcess();
+      need_pre_extrusion = true;
       if (err == E_SUCCESS) {
         pl_recovery.SaveCmdLine(pl_recovery.cur_data_.FilePosition);
         if (pl_recovery.cur_data_.FilePosition > 0) {
@@ -1793,6 +1908,7 @@ ErrCode SystemService::ChangeSystemStatus(SSTP_Event_t &event) {
   case SYSCTL_OPC_STOP:
   case SYSCTL_OPC_FINISH:
     LOG_I("SC req %s\n", (event.op_code == SYSCTL_OPC_STOP)? "STOP" : "FINISH");
+    need_pre_extrusion = true;
     err = StopTrigger(TRIGGER_SOURCE_SC, event.op_code);
     if (err == E_SUCCESS)
       need_ack = false;
@@ -1910,6 +2026,12 @@ ErrCode SystemService::RecoverFromPowerLoss(SSTP_Event_t &event) {
     if (err == E_SUCCESS) {
       systemservice.SetCurrentStatus(SYSTAT_RESUME_WAITING);
       systemservice.SetWorkingPort(WORKING_PORT_SC);
+      if (laser->IsOnline()) {
+        if (planner.laser_inline.status.isEnabled)
+          laser->SetOutputInline(pl_recovery.pre_data_.laser_percent);
+        else
+          laser->SetOutputInline((uint16_t)0);
+      }
       pl_recovery.cur_data_.FilePosition = pl_recovery.pre_data_.FilePosition;
       if (pl_recovery.cur_data_.FilePosition > 0)
         current_line_ =  pl_recovery.cur_data_.FilePosition - 1;
@@ -1989,6 +2111,7 @@ ErrCode SystemService::SendHomeAndCoordinateStatus(SSTP_Event_t &event) {
 
 ErrCode SystemService::ChangeRuntimeEnv(SSTP_Event_t &event) {
   ErrCode ret = E_SUCCESS;
+  volatile uint32_t type = event.data[0];
 
   float param;
 
@@ -1996,25 +2119,37 @@ ErrCode SystemService::ChangeRuntimeEnv(SSTP_Event_t &event) {
 
   param /= 1000;
 
-  switch (event.data[0]) {
+  switch (type) {
   case RENV_TYPE_FEEDRATE:
     if (param > 500 || param < 0) {
       LOG_E("invalid feedrate scaling: %.2f\n", param);
       ret = E_PARAM;
       break;
     }
-    feedrate_percentage = (int16_t)param;
+
+    if (MODULE_TOOLHEAD_DUALEXTRUDER == ModuleBase::toolhead()) {
+      extruders_feedrate_percentage[0] = (int16_t)param;
+      if (active_extruder == 0) {
+        feedrate_percentage = extruders_feedrate_percentage[0];
+      }
+    } else if (MODULE_TOOLHEAD_3DP == ModuleBase::toolhead()) {
+      extruders_feedrate_percentage[0] = (int16_t)param;
+      feedrate_percentage = (int16_t)param;
+    } else {
+      feedrate_percentage = (int16_t)param;
+    }
+
     LOG_I("feedrate scaling: %d\n", feedrate_percentage);
     break;
 
   case RENV_TYPE_HOTEND_TEMP:
-    LOG_I("new hotend temp: %.2f\n", param);
-    if (MODULE_TOOLHEAD_3DP != ModuleBase::toolhead()) {
+    LOG_I("new hotend0 temp: %.2f\n", param);
+    if ((MODULE_TOOLHEAD_3DP != ModuleBase::toolhead()) && (MODULE_TOOLHEAD_DUALEXTRUDER != ModuleBase::toolhead())) {
       ret = E_INVALID_STATE;
       break;
     }
 
-    if (param < HEATER_0_MAXTEMP)
+    if (param < thermalManager.temp_range[0].maxtemp)
       thermalManager.setTargetHotend((int16_t)param, 0);
     else
       ret = E_PARAM;
@@ -2022,7 +2157,7 @@ ErrCode SystemService::ChangeRuntimeEnv(SSTP_Event_t &event) {
 
   case RENV_TYPE_BED_TEMP:
     LOG_I("new bed temp: %.2f\n", param);
-    if (MODULE_TOOLHEAD_3DP != ModuleBase::toolhead()) {
+    if (MODULE_TOOLHEAD_3DP != ModuleBase::toolhead() && MODULE_TOOLHEAD_DUALEXTRUDER != ModuleBase::toolhead()) {
       ret = E_INVALID_STATE;
       break;
     }
@@ -2035,7 +2170,11 @@ ErrCode SystemService::ChangeRuntimeEnv(SSTP_Event_t &event) {
 
   case RENV_TYPE_LASER_POWER:
     LOG_I("new laser power: %.2f\n", param);
-    if ((MODULE_TOOLHEAD_LASER != ModuleBase::toolhead()) && (MODULE_TOOLHEAD_LASER_10W != ModuleBase::toolhead())) {
+    if ((ModuleBase::toolhead() != MODULE_TOOLHEAD_LASER) &&
+        (ModuleBase::toolhead() != MODULE_TOOLHEAD_LASER_10W) &&
+        (ModuleBase::toolhead() != MODULE_TOOLHEAD_LASER_20W) &&
+        (ModuleBase::toolhead() != MODULE_TOOLHEAD_LASER_40W)
+    ) {
       ret = E_INVALID_STATE;
       break;
     }
@@ -2051,6 +2190,7 @@ ErrCode SystemService::ChangeRuntimeEnv(SSTP_Event_t &event) {
     break;
 
   case RENV_TYPE_ZOFFSET:
+    LOG_I("set extruder0 live_z_offset: %f\n", param);
     ret = levelservice.UpdateLiveZOffset(param);
     break;
 
@@ -2074,8 +2214,55 @@ ErrCode SystemService::ChangeRuntimeEnv(SSTP_Event_t &event) {
     }
     break;
 
+  case RENV_TYPE_EXTRUDER1_FEEDRATE:
+    if (param > 500 || param < 0) {
+      LOG_E("invalid extruder1 feedrate scaling: %.2f\n", param);
+      ret = E_PARAM;
+      break;
+    }
+
+    if (MODULE_TOOLHEAD_DUALEXTRUDER != ModuleBase::toolhead()) {
+      ret = E_INVALID_STATE;
+      break;
+    }
+
+    extruders_feedrate_percentage[1] = (int16_t)param;
+    if (active_extruder == 1) {
+      feedrate_percentage = extruders_feedrate_percentage[1];
+    }
+    LOG_I("extruder1 feedrate scaling: %d\n", extruders_feedrate_percentage[1]);
+    break;
+
+  case RENV_TYPE_EXTRUDER1_HOTEND_TEMP:
+    LOG_I("new hotend1 temp: %.2f\n", param);
+    if (MODULE_TOOLHEAD_DUALEXTRUDER != ModuleBase::toolhead()) {
+      ret = E_INVALID_STATE;
+      break;
+    }
+
+    if (param < thermalManager.temp_range[1].maxtemp)
+      thermalManager.setTargetHotend((int16_t)param, 1);
+    else
+      ret = E_PARAM;
+    break;
+
+  case RENV_TYPE_EXTRUDER1_ZOFFSET:
+    LOG_I("set extruder1 live_z_offset: %f\n", param);
+    ret = levelservice.UpdateLiveZOffset(param, 1);
+    break;
+
+  case RENV_TYPE_EXTRUDER0_FLOW_RATE:
+  case RENV_TYPE_EXTRUDER1_FLOW_RATE:
+    type -= RENV_TYPE_EXTRUDER0_FLOW_RATE;
+    taskENTER_CRITICAL();
+    planner.flow_percentage[type] = param;
+    planner.refresh_e_factor(type);
+    taskEXIT_CRITICAL();
+    LOG_I("set extruder[%d] flow rate: %.2f\n", type, param);
+    break;
+
   default:
-    LOG_E("invalid parameter type\n", event.data[0]);
+    LOG_E("invalid parameter type\n", type);
     ret = E_PARAM;
     break;
   }
@@ -2089,16 +2276,24 @@ ErrCode SystemService::ChangeRuntimeEnv(SSTP_Event_t &event) {
 ErrCode SystemService::GetRuntimeEnv(SSTP_Event_t &event) {
   int   tmp_i32;
   uint8_t buff[5];
+  volatile uint32_t type = event.data[0];
 
-  LOG_I("SC get env: %u\n", event.data[0]);
+  LOG_I("SC get env: %u\n", type);
 
   buff[0] = E_SUCCESS;
 
-  switch (event.data[0]) {
+  switch (type) {
   case RENV_TYPE_FEEDRATE:
-    tmp_i32 = (int)(pl_recovery.pre_data_.feedrate_percentage * 1000.0f);
-    WORD_TO_PDU_BYTES(buff+1, (int)tmp_i32);
-    LOG_I("feedrate_percentage: %d\n", pl_recovery.pre_data_.feedrate_percentage);
+    if (ModuleBase::toolhead() == MODULE_TOOLHEAD_DUALEXTRUDER || ModuleBase::toolhead() == MODULE_TOOLHEAD_3DP) {
+      tmp_i32 = (int)(extruders_feedrate_percentage[0] * 1000.0f);
+      WORD_TO_PDU_BYTES(buff+1, (int)tmp_i32);
+      LOG_I("feedrate_percentage 0: %d\n", extruders_feedrate_percentage[0]);
+    }
+    else {
+      tmp_i32 = (int)(extruders_feedrate_percentage[0] * 1000.0f);
+      WORD_TO_PDU_BYTES(buff+1, (int)tmp_i32);
+      LOG_I("feedrate_percentage: %d\n", feedrate_percentage);
+    }
     break;
 
   case RENV_TYPE_LASER_POWER:
@@ -2119,9 +2314,37 @@ ErrCode SystemService::GetRuntimeEnv(SSTP_Event_t &event) {
     LOG_I("cnc power: %d\n", pl_recovery.pre_data_.cnc_power);
     break;
 
+  case RENV_TYPE_EXTRUDER1_FEEDRATE:
+    if (ModuleBase::toolhead() != MODULE_TOOLHEAD_DUALEXTRUDER) {
+      buff[0] = E_INVALID_STATE;
+      break;
+    }
+    tmp_i32 = (int)(extruders_feedrate_percentage[1] * 1000.0f);
+    WORD_TO_PDU_BYTES(buff+1, (int)tmp_i32);
+    LOG_I("feedrate_percentage 1: %d\n", extruders_feedrate_percentage[1]);
+    break;
+
+  case RENV_TYPE_EXTRUDER1_ZOFFSET:
+    if (ModuleBase::toolhead() != MODULE_TOOLHEAD_DUALEXTRUDER) {
+      buff[0] = E_INVALID_STATE;
+      break;
+    }
+    tmp_i32 = (int)(levelservice.live_z_offset((uint8_t)1) * 1000);
+    WORD_TO_PDU_BYTES(buff+1, tmp_i32);
+    LOG_I("live z offset: %.3f\n", levelservice.live_z_offset((uint8_t)1));
+    break;
+
+  case RENV_TYPE_EXTRUDER0_FLOW_RATE:
+  case RENV_TYPE_EXTRUDER1_FLOW_RATE:
+    type -= RENV_TYPE_EXTRUDER0_FLOW_RATE;
+    tmp_i32 = (int32_t)(planner.flow_percentage[type] * 1000);
+    WORD_TO_PDU_BYTES(buff+1, tmp_i32);
+    LOG_I("get extruder[%d] flow rate: %.2f\n", type, planner.flow_percentage[type]);
+    break;
+
   default:
     buff[0] = E_FAILURE;
-    LOG_I("cannot get this env: %u\n", event.data[0]);
+    LOG_I("cannot get this env: %u\n", type);
     break;
   }
 
@@ -2193,7 +2416,11 @@ ErrCode SystemService::CallbackPreQS(QuickStopSource source) {
     // reset the status of filament monitor
     runout.reset();
     // make sure laser is off
-    if ((ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER) || (ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_10W)) {
+    if ((ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER) ||
+        (ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_10W) ||
+        (ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_20W) ||
+        (ModuleBase::toolhead() == MODULE_TOOLHEAD_LASER_40W)
+    ) {
       laser->TurnOff();
     }
     break;
@@ -2265,5 +2492,13 @@ ErrCode SystemService::CallbackPostQS(QuickStopSource source) {
   }
 
   return E_SUCCESS;
+}
+
+bool SystemService::GetBackupCurrentPosition(float *position, uint8_t size) {
+  bool ret = false;
+  if (ModuleBase::toolhead() == MODULE_TOOLHEAD_DUALEXTRUDER) {
+    ret = printer_dualextruder.GetToolChangePrePosition(position, size);
+  }
+  return ret;
 }
 

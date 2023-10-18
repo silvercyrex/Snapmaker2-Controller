@@ -337,6 +337,10 @@ class Temperature {
       #endif
     #endif
 
+    #if (MOTHERBOARD == BOARD_SNAPMAKER_2_0)
+      static temp_range_t temp_range[HOTENDS];
+    #endif
+
   private:
 
     #if EARLY_WATCHDOG
@@ -361,7 +365,9 @@ class Temperature {
       static lpq_ptr_t lpq_ptr;
     #endif
 
-    static temp_range_t temp_range[HOTENDS];
+    #if (MOTHERBOARD != BOARD_SNAPMAKER_2_0)
+      static temp_range_t temp_range[HOTENDS];
+    #endif
 
     #if HAS_HEATED_BED
       #if WATCH_BED
@@ -610,12 +616,15 @@ class Temperature {
       #if ENABLED(AUTO_POWER_CONTROL)
         powerManager.power_on();
       #endif
-      temp_hotend[HOTEND_INDEX].target = MIN(celsius, temp_range[HOTEND_INDEX].maxtemp - 15);
+      if (celsius < 0)
+        temp_hotend[HOTEND_INDEX].target = 0;
+      else
+        temp_hotend[HOTEND_INDEX].target = MIN(celsius, temp_range[HOTEND_INDEX].maxtemp - HOTEND_OVERSHOOT);
       start_watching_heater(HOTEND_INDEX);
       start_watching_heater_tempdrop(HOTEND_INDEX);
       start_watching_heater_notheated(true, HOTEND_INDEX);
       #if (MOTHERBOARD == BOARD_SNAPMAKER_2_0)
-        printer1->SetHeater(celsius, e);
+        printer1->SetHeater(temp_hotend[HOTEND_INDEX].target, e);
       #endif
     }
 
@@ -651,7 +660,15 @@ class Temperature {
     }
 
     #if HAS_TEMP_HOTEND
+      // Enable ENABLE_CUSTOM_M109_PARAM M109 'C' 'W'
+      #define ENABLE_CUSTOM_M109_PARAM
       static bool wait_for_hotend(const uint8_t target_extruder, const bool no_wait_for_cooling=true
+        #if ENABLED(ENABLE_CUSTOM_M109_PARAM)
+          ,
+          int16_t temp_window = TEMP_WINDOW,
+          int16_t temp_hystersis = TEMP_HYSTERESIS,
+          uint32_t  temp_residency_time = TEMP_RESIDENCY_TIME
+        #endif
         #if G26_CLICK_CAN_CANCEL
           , const bool click_to_cancel=false
         #endif

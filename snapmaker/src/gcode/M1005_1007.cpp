@@ -90,7 +90,13 @@ void GcodeSuite::M1006() {
 
   switch (ModuleBase::toolhead()) {
   case MODULE_TOOLHEAD_3DP:
+  case MODULE_TOOLHEAD_DUALEXTRUDER:
     SERIAL_ECHOLN("3DP");
+    if (ModuleBase::toolhead() == MODULE_TOOLHEAD_DUALEXTRUDER) {
+      printer1->ShowInfo();
+      // show hotend offset
+      M218();
+    }
     break;
 
   case MODULE_TOOLHEAD_LASER:
@@ -103,6 +109,22 @@ void GcodeSuite::M1006() {
 
   case MODULE_TOOLHEAD_LASER_10W:
     SERIAL_ECHOLN("10W LASER");
+    SERIAL_ECHO("Current Status: ");
+    SERIAL_ECHOLN((laser->state() == TOOLHEAD_LASER_STATE_ON)? "ON" : "OFF");
+    SERIAL_ECHOLNPAIR("Current Power: ", laser->power());
+    SERIAL_ECHOLNPAIR("Focus Height: ", laser->focus());
+    break;
+
+  case MODULE_TOOLHEAD_LASER_20W:
+    SERIAL_ECHOLN("20W LASER");
+    SERIAL_ECHO("Current Status: ");
+    SERIAL_ECHOLN((laser->state() == TOOLHEAD_LASER_STATE_ON)? "ON" : "OFF");
+    SERIAL_ECHOLNPAIR("Current Power: ", laser->power());
+    SERIAL_ECHOLNPAIR("Focus Height: ", laser->focus());
+    break;
+
+  case MODULE_TOOLHEAD_LASER_40W:
+    SERIAL_ECHOLN("40W LASER");
     SERIAL_ECHO("Current Status: ");
     SERIAL_ECHOLN((laser->state() == TOOLHEAD_LASER_STATE_ON)? "ON" : "OFF");
     SERIAL_ECHOLNPAIR("Current Power: ", laser->power());

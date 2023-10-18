@@ -37,7 +37,7 @@
  */
 
 // Change EEPROM version if the structure changes
-#define EEPROM_VERSION "V73"
+#define EEPROM_VERSION "V74"
 #define EEPROM_OFFSET 100
 
 // Check the integrity of data offsets.
@@ -299,6 +299,10 @@ typedef struct SettingsDataStruct {
   float s_home_offset[XN];
   float m_home_offset[XN];
   float l_home_offset[XN];
+  float m_home_offset_3dp2e[XN];
+  float s_home_offset_3dp2e[XN];
+  float l_home_offset_3dp2e[XN];
+  bool quick_change_adapter;
   #endif
 
   float print_min_planner_speed;
@@ -1144,7 +1148,15 @@ void MarlinSettings::postprocess() {
         EEPROM_WRITE(m_home_offset[i]);
         _FIELD_TEST(l_home_offset[i]);
         EEPROM_WRITE(l_home_offset[i]);
+        _FIELD_TEST(s_home_offset_3dp2e[i]);
+        EEPROM_WRITE(s_home_offset_3dp2e[i]);
+        _FIELD_TEST(m_home_offset_3dp2e[i]);
+        EEPROM_WRITE(m_home_offset_3dp2e[i]);
+        _FIELD_TEST(l_home_offset_3dp2e[i]);
+        EEPROM_WRITE(l_home_offset_3dp2e[i]);
       }
+      _FIELD_TEST(quick_change_adapter);
+      EEPROM_WRITE(quick_change_adapter);
     }
     #endif //ENABLED(SW_MACHINE_SIZE)
     _FIELD_TEST(print_min_planner_speed);
@@ -1244,7 +1256,8 @@ void MarlinSettings::postprocess() {
         uint32_t tmp1[XN + esteppers];
         EEPROM_READ(tmp1);                         // max_acceleration_mm_per_s2
         EEPROM_READ(planner.settings.min_segment_time_us);
-
+        EEPROM_READ(planner.settings.e_axis_steps_per_mm_backup[0]);
+        EEPROM_READ(planner.settings.e_axis_steps_per_mm_backup[1]);
         float tmp2[XN + esteppers], tmp3[XN + esteppers];
         EEPROM_READ(tmp2);                         // axis_steps_per_mm
         EEPROM_READ(tmp3);                         // max_feedrate_mm_s
@@ -1259,7 +1272,7 @@ void MarlinSettings::postprocess() {
         EEPROM_READ(planner.settings.travel_acceleration);
         EEPROM_READ(planner.settings.min_feedrate_mm_s);
         EEPROM_READ(planner.settings.min_travel_feedrate_mm_s);
-        
+
         #if ENABLED(BACKLASH_GCODE)
           // M425
           EEPROM_READ(backlash_distance_mm);
@@ -1897,7 +1910,15 @@ void MarlinSettings::postprocess() {
           EEPROM_READ(m_home_offset[i]);
           _FIELD_TEST(l_home_offset[i]);
           EEPROM_READ(l_home_offset[i]);
+          _FIELD_TEST(s_home_offset_3dp2e[i]);
+          EEPROM_READ(s_home_offset_3dp2e[i]);
+          _FIELD_TEST(m_home_offset_3dp2e[i]);
+          EEPROM_READ(m_home_offset_3dp2e[i]);
+          _FIELD_TEST(l_home_offset_3dp2e[i]);
+          EEPROM_READ(l_home_offset_3dp2e[i]);
         }
+        _FIELD_TEST(quick_change_adapter);
+        EEPROM_READ(quick_change_adapter);
       }
       set_homeoffset();
 
@@ -2124,6 +2145,8 @@ void MarlinSettings::reset() {
     planner.settings.max_feedrate_mm_s[i]          = pgm_read_float(&tmp2[ALIM(i, tmp2)]);
     planner.settings.max_acceleration_mm_per_s2[i] = pgm_read_dword(&tmp3[ALIM(i, tmp3)]);
   }
+  planner.settings.e_axis_steps_per_mm_backup[0] = SINGLE_EXTRUDER_E_STEPS_PER_MM;
+  planner.settings.e_axis_steps_per_mm_backup[1] = DUAL_EXTRUDER_E_STEPS_PER_MM;
   linear_p->reset_axis_steps_per_unit();
 
   planner.settings.min_segment_time_us = DEFAULT_MINSEGMENTTIME;
@@ -2195,7 +2218,18 @@ void MarlinSettings::reset() {
   #endif
 
   #if HAS_LEVELING
+    GRID_MAX_POINTS_X = 3;
+    GRID_MAX_POINTS_Y = 3;
+
+    ABL_GRID_POINTS_VIRT_X = (GRID_MAX_POINTS_X - 1) * (BILINEAR_SUBDIVISIONS) + 1;
+    ABL_GRID_POINTS_VIRT_Y = (GRID_MAX_POINTS_Y - 1) * (BILINEAR_SUBDIVISIONS) + 1;
+    ABL_TEMP_POINTS_X = (GRID_MAX_POINTS_X + 2);
+    ABL_TEMP_POINTS_Y = (GRID_MAX_POINTS_Y + 2);
+
     reset_bed_level();
+    #if ENABLED(ABL_BILINEAR_SUBDIVISION)
+      bed_level_virt_interpolate();
+    #endif
   #endif
 
   #if HAS_BED_PROBE
@@ -2429,13 +2463,13 @@ void MarlinSettings::reset() {
 
   reset_min_planner_speed();
 
-  GRID_MAX_POINTS_X = 3;
-  GRID_MAX_POINTS_Y = 3;
+  // GRID_MAX_POINTS_X = 3;
+  // GRID_MAX_POINTS_Y = 3;
 
-  ABL_GRID_POINTS_VIRT_X = (GRID_MAX_POINTS_X - 1) * (BILINEAR_SUBDIVISIONS) + 1;
-  ABL_GRID_POINTS_VIRT_Y = (GRID_MAX_POINTS_Y - 1) * (BILINEAR_SUBDIVISIONS) + 1;
-  ABL_TEMP_POINTS_X = (GRID_MAX_POINTS_X + 2);
-  ABL_TEMP_POINTS_Y = (GRID_MAX_POINTS_Y + 2);
+  // ABL_GRID_POINTS_VIRT_X = (GRID_MAX_POINTS_X - 1) * (BILINEAR_SUBDIVISIONS) + 1;
+  // ABL_GRID_POINTS_VIRT_Y = (GRID_MAX_POINTS_Y - 1) * (BILINEAR_SUBDIVISIONS) + 1;
+  // ABL_TEMP_POINTS_X = (GRID_MAX_POINTS_X + 2);
+  // ABL_TEMP_POINTS_Y = (GRID_MAX_POINTS_Y + 2);
 
   //lightbar.set_brightness(MAX_BRIGHTNESS);
 
@@ -2680,6 +2714,12 @@ void MarlinSettings::reset() {
         );
         SERIAL_ECHOLNPAIR_F(" Z", LINEAR_UNIT(hotend_offset[Z_AXIS][e]), 3);
       }
+    #endif
+
+    #if (MOTHERBOARD == BOARD_SNAPMAKER_2_0)
+      float left_z_compensation = 1.0, right_z_compensation = 1.0;
+      printer1->GetZCompensation(left_z_compensation, right_z_compensation);
+      SERIAL_ECHOPAIR("  left_z_compensation: ", left_z_compensation, "  right_z_compensation: ", right_z_compensation, "\n");
     #endif
 
     /**
